@@ -1,6 +1,7 @@
 package middleware
 
 import (
+	"context"
 	"fmt"
 
 	"github.com/mmskazak/tcpwrapper"
@@ -8,7 +9,14 @@ import (
 
 // LogMiddleware creates a middleware that logs the message length and first N bytes
 func LogMiddleware(prefix string, maxPreviewBytes int) tcpwrapper.Middleware {
-	return func(data []byte) ([]byte, error) {
+	return func(ctx context.Context, data []byte) ([]byte, error) {
+		// Check if context is already cancelled
+		select {
+		case <-ctx.Done():
+			return data, ctx.Err()
+		default:
+		}
+
 		previewLen := len(data)
 		if previewLen > maxPreviewBytes {
 			previewLen = maxPreviewBytes
