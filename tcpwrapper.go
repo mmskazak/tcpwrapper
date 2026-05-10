@@ -2,6 +2,7 @@ package tcpwrapper
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"net"
@@ -14,13 +15,17 @@ import (
 )
 
 // Middleware defines a type of middleware function for processing messages.
-type Middleware func([]byte) ([]byte, error)
+// It now accepts context to support timeouts and cancellation.
+type Middleware func(ctx context.Context, data []byte) ([]byte, error)
 
 // Wrapper defines the public API for TCP wrapper
 type Wrapper interface {
 	AddRequestMiddleware(mw Middleware)
 	AddResponseMiddleware(mw Middleware)
-	HandleMessage() error
+	// HandleMessage processes a single message blockingly.
+	HandleMessage(ctx context.Context) error
+	// Serve starts listening for messages until context is cancelled or connection closes.
+	Serve(ctx context.Context) error
 	Close() error
 }
 
@@ -120,7 +125,7 @@ func (tw *tcpWrapper) readMessage(delimiter []byte) ([]byte, error) {
 
 // HandleMessage reads a complete message, determines its type (response or request),
 // and runs the corresponding middleware chain before sending the result back.
-func (tw *tcpWrapper) HandleMessage() error {
+func (tw *tcpWrapper) HandleMessage(ctx context.Context) error {
 	// Use RequestDelimiter to read the message.
 	message, err := tw.readMessage(tw.requestDelimiter)
 	if err != nil {
@@ -131,23 +136,52 @@ func (tw *tcpWrapper) HandleMessage() error {
 	if tw.isRequest(message) {
 		tw.logger.Infof("Request received: %s", string(message))
 		for _, mw := range tw.requestMiddlewares {
-			message, err = mw(message)
+			message, err = mw(ctx, message)
 			if err != nil {
 				return err
+			}
+			// Check if context was cancelled during middleware execution
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			default:
 			}
 		}
 	} else if tw.isResponse(message) {
 		tw.logger.Infof("Response received: %s", string(message))
 		for _, mw := range tw.responseMiddlewares {
-			message, err = mw(message)
+			message, err = mw(ctx, message)
 			if err != nil {
 				return err
+			}
+			// Check if context was cancelled during middleware execution
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			default:
 			}
 		}
 	}
 
 	_, err = tw.conn.Write(message)
 	return err
+}
+
+// Serve starts an infinite loop to handle messages until the context is cancelled or connection closes.
+func (tw *tcpWrapper) Serve(ctx context.Context) error {
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+			if err := tw.HandleMessage(ctx); err != nil {
+				if err == io.EOF {
+					return nil // Normal connection close
+				}
+				return err
+			}
+		}
+	}
 }
 
 // Close properly closes the connection.
