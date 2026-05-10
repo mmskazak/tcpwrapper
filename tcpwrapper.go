@@ -8,6 +8,7 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"sync"
 
 	isrequest "github.com/mmskazak/tcpwrapper/is_request"
 	isresponse "github.com/mmskazak/tcpwrapper/is_response"
@@ -40,6 +41,9 @@ type tcpWrapper struct {
 	isRequest           isrequest.IsRequestFunc
 	isResponse          isresponse.IsResponseFunc
 	logger              *zap.SugaredLogger
+	mu                  sync.RWMutex // protects middlewares and logger
+	closeOnce           sync.Once
+	closed              bool
 }
 
 // NewTCPWrapper creates a new instance of TCPWrapper with the given connection and options.
@@ -56,10 +60,8 @@ func NewTCPWrapper(conn net.Conn, opts ...Option) Wrapper {
 	}
 
 	// Create default logger if not set
-	if w.logger == nil {
-		logger, _ := zap.NewProduction()
-		w.logger = logger.Sugar()
-	}
+	logger, _ := zap.NewProduction()
+	w.logger = logger.Sugar()
 
 	// Apply all options
 	for _, opt := range opts {
@@ -70,12 +72,18 @@ func NewTCPWrapper(conn net.Conn, opts ...Option) Wrapper {
 }
 
 // AddRequestMiddleware adds a middleware for request processing.
+// This method is thread-safe and can be called concurrently.
 func (tw *tcpWrapper) AddRequestMiddleware(mw Middleware) {
+	tw.mu.Lock()
+	defer tw.mu.Unlock()
 	tw.requestMiddlewares = append(tw.requestMiddlewares, mw)
 }
 
 // AddResponseMiddleware adds a middleware for response processing.
+// This method is thread-safe and can be called concurrently.
 func (tw *tcpWrapper) AddResponseMiddleware(mw Middleware) {
+	tw.mu.Lock()
+	defer tw.mu.Unlock()
 	tw.responseMiddlewares = append(tw.responseMiddlewares, mw)
 }
 
@@ -123,19 +131,31 @@ func (tw *tcpWrapper) readMessage(delimiter []byte) ([]byte, error) {
 	return buffer, nil
 }
 
-// HandleMessage reads a complete message, determines its type (response or request),
+// ProcessMessage reads a complete message, determines its type (response or request),
 // and runs the corresponding middleware chain before sending the result back.
-func (tw *tcpWrapper) HandleMessage(ctx context.Context) error {
+// The method name was changed from HandleMessage to better reflect its purpose.
+func (tw *tcpWrapper) ProcessMessage(ctx context.Context) error {
 	// Use RequestDelimiter to read the message.
 	message, err := tw.readMessage(tw.requestDelimiter)
 	if err != nil {
 		return err
 	}
 
+	// Get middlewares with read lock
+	tw.mu.RLock()
+	requestMiddlewares := make([]Middleware, len(tw.requestMiddlewares))
+	responseMiddlewares := make([]Middleware, len(tw.responseMiddlewares))
+	copy(requestMiddlewares, tw.requestMiddlewares)
+	copy(responseMiddlewares, tw.responseMiddlewares)
+	isRequest := tw.isRequest
+	isResponse := tw.isResponse
+	logger := tw.logger
+	tw.mu.RUnlock()
+
 	// Use the provided isRequest and isResponse functions to determine message type
-	if tw.isRequest(message) {
-		tw.logger.Infof("Request received: %s", string(message))
-		for _, mw := range tw.requestMiddlewares {
+	if isRequest(message) {
+		logger.Infof("Request received: %s", string(message))
+		for _, mw := range requestMiddlewares {
 			message, err = mw(ctx, message)
 			if err != nil {
 				return err
@@ -147,9 +167,9 @@ func (tw *tcpWrapper) HandleMessage(ctx context.Context) error {
 			default:
 			}
 		}
-	} else if tw.isResponse(message) {
-		tw.logger.Infof("Response received: %s", string(message))
-		for _, mw := range tw.responseMiddlewares {
+	} else if isResponse(message) {
+		logger.Infof("Response received: %s", string(message))
+		for _, mw := range responseMiddlewares {
 			message, err = mw(ctx, message)
 			if err != nil {
 				return err
@@ -167,6 +187,13 @@ func (tw *tcpWrapper) HandleMessage(ctx context.Context) error {
 	return err
 }
 
+// HandleMessage reads a complete message, determines its type (response or request),
+// and runs the corresponding middleware chain before sending the result back.
+// Deprecated: Use ProcessMessage instead for clearer semantics.
+func (tw *tcpWrapper) HandleMessage(ctx context.Context) error {
+	return tw.ProcessMessage(ctx)
+}
+
 // Serve starts an infinite loop to handle messages until the context is cancelled or connection closes.
 func (tw *tcpWrapper) Serve(ctx context.Context) error {
 	for {
@@ -174,7 +201,7 @@ func (tw *tcpWrapper) Serve(ctx context.Context) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		default:
-			if err := tw.HandleMessage(ctx); err != nil {
+			if err := tw.ProcessMessage(ctx); err != nil {
 				if err == io.EOF {
 					return nil // Normal connection close
 				}
@@ -184,9 +211,23 @@ func (tw *tcpWrapper) Serve(ctx context.Context) error {
 	}
 }
 
-// Close properly closes the connection.
+// Close properly closes the connection and releases resources including the logger.
+// This method is thread-safe and can be called multiple times safely.
 func (tw *tcpWrapper) Close() error {
-	return tw.conn.Close()
+	var err error
+	tw.closeOnce.Do(func() {
+		tw.mu.Lock()
+		tw.closed = true
+		tw.mu.Unlock()
+		
+		// Sync and close the logger to prevent resource leak
+		if tw.logger != nil {
+			_ = tw.logger.Sync()
+		}
+		
+		err = tw.conn.Close()
+	})
+	return err
 }
 
 // extractContentLength searches for the "Content-Length" header in headers and returns its value.

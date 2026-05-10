@@ -2,16 +2,10 @@
 # Compiled and build artifacts
 *.o
 *.obj
-*.a
-*.so
-*.dll
-*.exe
 *.out
 
 # Dependencies
 vendor/
-*.mod
-*.sum
 
 # Logs and temp files
 *.log
@@ -22,13 +16,8 @@ vendor/
 .vscode/
 .idea/
 
-# Coverage
+# Coverage and test artifacts
+.coverage
 coverage/
 htmlcov/
-.coverage
-
-# Environment
-.env
-.env.local
-*.env.*
 ```
